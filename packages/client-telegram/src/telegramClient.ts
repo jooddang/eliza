@@ -1,8 +1,10 @@
 import { Context, Telegraf } from "telegraf";
 import { message } from "telegraf/filters";
-import { IAgentRuntime, elizaLogger } from "@elizaos/core";
+import { IAgentRuntime, elizaLogger, UUID, Memory, Content, getEmbeddingZeroVector, HandlerCallback } from "@elizaos/core";
 import { MessageManager } from "./messageManager.ts";
 import { getOrCreateRecommenderInBe } from "./getOrCreateRecommenderInBe.ts";
+import { composeContext, stringToUuid, generateShouldRespond, ModelClass, composeRandomUser, telegramShouldRespondTemplate, telegramMessageHandlerTemplate } from './utils';
+import { IImageDescriptionService, ServiceType } from "@elizaos/core";
 
 export class TelegramClient {
     private bot: Telegraf<Context>;
@@ -200,5 +202,255 @@ export class TelegramClient {
         //await 
             this.bot.stop();
         elizaLogger.log("Telegram bot stopped");
+    }
+
+
+    private _isMessageForMe(message: any): boolean {
+        return message.text.includes(`@${this.bot.botInfo.username}`);
+    }
+
+    private _shouldRespondBasedOnContext(message: any, chatState: any): boolean {
+        return chatState.currentHandler === "telegramMessageHandler";
+    }
+
+    private interestChats: Record<string, any> = {};
+
+    private async _shouldRespond(
+        message: any,
+        state: any
+    ): Promise<boolean> {
+        // Always respond if bot is mentioned
+        if (this._isMessageForMe(message)) {
+            elizaLogger.info(`Bot mentioned`);
+            return true;
+        }
+        // Respond to private chats
+        if (message.chat.type === "private") {
+            return true;
+        }
+        // Respond to group chats based on content and context
+        const chatId = message.chat.id.toString();
+        const chatState = this.interestChats[chatId];
+        const messageText = "text" in message ? message.text : "caption" in message ? (message as any).caption : "";
+        if (chatState) {
+            const shouldRespondContext = await this._shouldRespondBasedOnContext(message, chatState);
+            return shouldRespondContext;
+        }
+        // Use AI to decide for text or captions
+        if (messageText) {
+            const shouldRespondContext = composeContext({
+                state,
+                template: this.runtime.character.templates?.telegramShouldRespondTemplate || this.runtime.character?.templates?.shouldRespondTemplate || composeRandomUser(telegramShouldRespondTemplate, 2),
+            });
+            const response = await generateShouldRespond({
+                runtime: this.runtime,
+                context: shouldRespondContext,
+                modelClass: ModelClass.SMALL,
+            });
+            return response === "RESPOND";
+        }
+        return false;
+    }
+
+    public async handleMessage(ctx: Context): Promise<void> {
+        if (!ctx.message || !ctx.from) {
+            return; // Exit if no message or sender info
+        }
+        if (this.runtime.character.clientConfig?.telegram?.shouldIgnoreBotMessages && ctx.from.is_bot) {
+            return;
+        }
+        if (this.runtime.character.clientConfig?.telegram?.shouldIgnoreDirectMessages && ctx.chat?.type === "private") {
+            return;
+        }
+        const message = ctx.message;
+        const chatId = ctx.chat?.id.toString();
+        const messageText = "text" in message ? message.text : "caption" in message ? (message as any).caption : "";
+        // Track all messages in the group chat
+        if (chatId && messageText) {
+            this.interestChats[chatId] = this.interestChats[chatId] || { currentHandler: undefined, lastMessageSent: 0, messages: [] };
+            this.interestChats[chatId].messages.push({
+                userId: stringToUuid(ctx.from.id.toString()),
+                userName: ctx.from.username || ctx.from.first_name || "Unknown User",
+                content: { text: messageText, source: "telegram" },
+            });
+            this.interestChats[chatId].lastMessageSent = Date.now();
+        }
+        // Process the message and decide whether to respond
+        try {
+            const userId = stringToUuid(ctx.from.id.toString()) as UUID;
+            const userName = ctx.from.username || ctx.from.first_name || "Unknown User";
+            const roomId = stringToUuid(chatId + "-" + this.runtime.agentId) as UUID;
+            const agentId = this.runtime.agentId;
+            await this.runtime.ensureConnection(userId, roomId, userName, userName, "telegram");
+            const messageId = stringToUuid(message.message_id.toString() + "-" + this.runtime.agentId) as UUID;
+            const imageInfo = await this.processImage(message);
+            const fullText = imageInfo ? `${messageText} ${imageInfo.description}` : messageText;
+            if (!fullText) {
+                return; // Skip if no content
+            }
+            const content: Content = {
+                text: fullText,
+                source: "telegram",
+                inReplyTo: "reply_to_message" in message && message.reply_to_message ? stringToUuid(message.reply_to_message.message_id.toString() + "-" + this.runtime.agentId) : undefined,
+            };
+            const memory: Memory = {
+                id: messageId,
+                agentId,
+                userId,
+                roomId,
+                content,
+                createdAt: message.date * 1000,
+                embedding: getEmbeddingZeroVector(),
+            };
+            await this.runtime.messageManager.createMemory(memory);
+            let state = await this.runtime.composeState(memory);
+            state = await this.runtime.updateRecentMessageState(state);
+            const shouldRespond = await this._shouldRespond(message, state);
+            if (shouldRespond) {
+                const context = composeContext({
+                    state,
+                    template: this.runtime.character.templates?.telegramMessageHandlerTemplate || this.runtime.character?.templates?.messageHandlerTemplate || telegramMessageHandlerTemplate,
+                });
+                const responseContent = await this._generateResponse(memory, state, context);
+                if (!responseContent || !responseContent.text) return;
+                const callback: HandlerCallback = async (content: Content) => {
+                    const sentMessages = await this.sendMessageInChunks(ctx, content, message.message_id);
+                    if (sentMessages) {
+                        const memories: Memory[] = [];
+                        for (let i = 0; i < sentMessages.length; i++) {
+                            const sentMessage = sentMessages[i];
+                            const isLastMessage = i === sentMessages.length - 1;
+                            const memory: Memory = {
+                                id: stringToUuid(sentMessage.message_id.toString() + "-" + this.runtime.agentId),
+                                agentId,
+                                userId: agentId,
+                                roomId,
+                                content: {
+                                    ...content,
+                                    text: sentMessage.text,
+                                    inReplyTo: messageId,
+                                },
+                                createdAt: sentMessage.date * 1000,
+                                embedding: getEmbeddingZeroVector(),
+                            };
+                            memory.content.action = !isLastMessage ? "CONTINUE" : content.action;
+                            await this.runtime.messageManager.createMemory(memory);
+                            memories.push(memory);
+                        }
+                        return memories;
+                    }
+                };
+                const responseMessages = await callback(responseContent);
+                state = await this.runtime.updateRecentMessageState(state);
+                await this.runtime.processActions(memory, responseMessages, state, callback);
+            }
+            await this.runtime.evaluate(memory, state, shouldRespond);
+        } catch (error) {
+            elizaLogger.error("❌ Error handling message:", error);
+            elizaLogger.error("Error sending message:", error);
+        }
+    }
+
+    private async processImage(message: any): Promise<{ description: string } | null> {
+        try {
+            let imageUrl: string | null = null;
+
+            if ("photo" in message && message.photo?.length > 0) {
+                const photo = message.photo[message.photo.length - 1];
+                const fileLink = await this.bot.telegram.getFileLink(photo.file_id);
+                imageUrl = fileLink.toString();
+            } else if ("document" in message && message.document?.mime_type?.startsWith("image/")) {
+                const fileLink = await this.bot.telegram.getFileLink(message.document.file_id);
+                imageUrl = fileLink.toString();
+            }
+
+            if (imageUrl) {
+                const imageDescriptionService = this.runtime.getService<IImageDescriptionService>(ServiceType.IMAGE_DESCRIPTION);
+                if (imageDescriptionService) {
+                    const { title, description } = await imageDescriptionService.describeImage(imageUrl);
+                    return { description: `[Image: ${title}\n${description}]` };
+                }
+            }
+        } catch (error) {
+            elizaLogger.error("Error processing image:", error);
+        }
+
+        return null;
+    }
+
+    private async _generateResponse(
+        message: Memory,
+        state: any,
+        context: string
+    ): Promise<Content | null> {
+        try {
+            const memory: Memory = {
+                id: stringToUuid(Date.now().toString()),
+                userId: this.runtime.agentId,
+                agentId: this.runtime.agentId,
+                roomId: message.roomId,
+                content: {
+                    text: context,
+                    source: "telegram"
+                },
+                embedding: getEmbeddingZeroVector()
+            };
+
+            await this.runtime.messageManager.createMemory(memory);
+            const response = await this.runtime.messageManager.searchMemoriesByEmbedding(
+                memory.embedding,
+                {
+                    match_threshold: 0.8,
+                    count: 1,
+                    roomId: memory.roomId,
+                    unique: true
+                }
+            );
+
+            return response[0]?.content || null;
+        } catch (error) {
+            elizaLogger.error("Error generating response:", error);
+            return null;
+        }
+    }
+
+    private async sendMessageInChunks(
+        ctx: Context,
+        content: Content,
+        replyToMessageId?: number
+    ): Promise<any[]> {
+        const chunks = this.splitMessage(content.text || "", 4096);
+        const sentMessages = [];
+
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            const sentMessage = await ctx.telegram.sendMessage(ctx.chat.id, chunk, {
+                reply_parameters: i === 0 && replyToMessageId
+                    ? { message_id: replyToMessageId }
+                    : undefined,
+                parse_mode: "Markdown",
+            });
+            sentMessages.push(sentMessage);
+        }
+
+        return sentMessages;
+    }
+
+    private splitMessage(text: string, maxLength: number = 4096): string[] {
+        const chunks: string[] = [];
+        let currentChunk = "";
+
+        const lines = text.split("\n");
+        for (const line of lines) {
+            if (currentChunk.length + line.length + 1 <= maxLength) {
+                currentChunk += (currentChunk ? "\n" : "") + line;
+            } else {
+                if (currentChunk) chunks.push(currentChunk);
+                currentChunk = line;
+            }
+        }
+
+        if (currentChunk) chunks.push(currentChunk);
+        return chunks;
     }
 }
